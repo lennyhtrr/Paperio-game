@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no" />
+<title>Paper.io-like (mobile)</title>
+<style>
+  html,body{height:100%;margin:0;background:#111;color:#eee;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;}
+  #gameWrap{display:flex;flex-direction:column;height:100%;}
+  #topBar{padding:6px 8px;background:#0f0f12;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid rgba(255,255,255,0.03)}
+  #info{font-size:14px}
+  #canvasWrap{flex:1;display:flex;align-items:center;justify-content:center;background:#0b0b0b}
+  canvas{background:#0b0b0b;touch-action:none;display:block;border-radius:4px}
+  #controls{position:relative;width:100%;max-width:680px;margin:10px auto 18px;display:flex;justify-content:center;gap:12px;align-items:center}
+  .dpad{width:160px;height:160px;position:relative;display:grid;grid-template-columns:1fr 1fr 1fr;grid-template-rows:1fr 1fr 1fr;gap:6px}
+  .btn{background:rgba(255,255,255,0.06);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px;color:#fff;user-select:none;-webkit-user-select:none}
+  .btn:active{background:rgba(255,255,255,0.14)}
+  .spacer{background:transparent;box-shadow:none;border:none}
+  #hud{position:absolute;left:12px;top:10px;background:rgba(0,0,0,0.25);padding:6px 8px;border-radius:6px;font-size:13px}
+  #restart{background:#ff5c5c;padding:6px 10px;border-radius:6px;color:#111;border:none;font-weight:600}
+  @media (max-width:420px){
+    .dpad{width:130px;height:130px}
+  }
+</style>
+</head>
+<body>
+<div id="gameWrap">
+  <div id="topBar">
+    <div id="info">Paper.io-like (HTML5) — tactile + clavier</div>
+    <div>
+      <button id="restart">Restart</button>
+    </div>
+  </div>
+  <div id="canvasWrap">
+    <canvas id="c"></canvas>
+    <div id="hud" style="display:none"></div>
+  </div>
+
+  <div id="controls" aria-hidden="true">
+    <div class="dpad" id="dpad">
+      <div class="spacer"></div>
+      <div class="btn" id="up">↑</div>
+      <div class="spacer"></div>
+
+      <div class="btn" id="left">←</div>
+      <div class="spacer"></div>
+      <div class="btn" id="right">→</div>
+
+      <div class="spacer"></div>
+      <div class="btn" id="down">↓</div>
+      <div class="spacer"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+/*
+  Paper.io-like — HTML5 single file
+  Mobile-friendly: arrow buttons + keyboard
+  Simple AI, flood-fill capture
+*/
+
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', {alpha:false});
+  const restartBtn = document.getElementById('restart');
+  const hud = document.getElementById('hud');
+
+  // Responsive grid sizing based on viewport for mobile performance
+  const maxCell = 12; // px
+  const minCellsX = 40; // ensure playable
+  const minCellsY = 28;
+
+  let CELL = 12;
+  let W = 64, H = 48; // grid dimensions (will adapt)
+  function resizeCanvas() {
+    const maxWidth = Math.min(window.innerWidth, 800) - 20;
+    const maxHeight = window.innerHeight - 180;
+    // adapt cell size so whole grid fits
+    // choose candidate cell size from maxCell downwards
+    let best = {cell:6, w:40, h:30};
+    for (let c = maxCell; c >= 6; c--) {
+      const gw = Math.floor(maxWidth / c);
+      const gh = Math.floor(maxHeight / c);
+      if (gw >= minCellsX && gh >= minCellsY) {
+        best = {cell:c, w:gw, h:gh};
+        break;
+      }
+      if (c===6) {
+        best = {cell:c, w:Math.max(minCellsX, gw), h:Math.max(minCellsY, gh)};
+      }
+    }
+    CELL = best.cell;
+    W = best.w;
+    H = best.h;
+    canvas.width = W * CELL;
+    canvas.height = H * CELL;
+    canvas.style.width = canvas.width + 'px';
+    canvas.style.height = canvas.height + 'px';
+  }
+  resizeCanvas();
+  window.addEventListener('resize', () => { resizeCanvas(); if(game) game.draw(); });
+
+  // Directions
+  const DIRS = {UP:0, RIGHT:1, DOWN:2, LEFT:3};
+  const V = [[0,-1],[1,0],[0,1],[-1,0]];
+
+  // Colors
+  const PLAYER_COLORS = [
+    '#00c0ff', '#ff6b6b', '#8bff8b', '#ffd26b', '#b98bff'
+  ];
+  const BG = '#0b0b0b';
+
+  // Game structure
+  function Game() {
+    this.owner = new Array(W);
+    this.trail = new Array(W);
+    for (let x=0;x<W;x++){
+      this.owner[x]=new Array(H).fill(-1);
+      this.trail[x]=new Array(H).fill(-1);
+    }
+    this.players = [];
+    this.ticks = 0;
+    this.running = true;
+    this.init();
+  }
+
+  Game.prototype.init = function() {
+    // spawn player near center
+    const px = Math.floor(W/2);
+    const py = Math.floor(H/2);
+    const player = {
+      id:0, x:px, y:py, dir:Math.floor(Math.random()*4),
+      alive:true, inTerritory:true, trail:[], score:0, color:PLAYER_COLORS[0]
+    };
+    this.players = [player];
+    this._initTerritory(player, Math.max(2, Math.floor(Math.min(W,H)/12)));
+
+    // bots
+    const BOT_COUNT = Math.max(2, Math.floor(Math.min(W,H)/20));
+    for (let i=0;i<BOT_COUNT;i++){
+      const bx = 2 + Math.floor(Math.random()*(W-5));
+      const by = 2 + Math.floor(Math.random()*(H-5));
+      const bot = {
+        id:i+1, x:bx, y:by, dir:Math.floor(Math.random()*4),
+        alive:true, inTerritory:true, trail:[], score:0, color:PLAYER_COLORS[(i+1)%PLAYER_COLORS.length]
+      };
+      this.players.push(bot);
+      this._initTerritory(bot, Math.max(1, Math.floor(Math.min(W,H)/18)));
+    }
+    this.updateScores();
+  };
+
+  Game.prototype._initTerritory = function(p, r) {
+    for (let dx=-r; dx<=r; dx++){
+      for (let dy=-r; dy<=r; dy++){
+        const x = clamp(p.x+dx,0,W-1);
+        const y = clamp(p.y+dy,0,H-1);
+        this.owner[x][y] = p.id;
+      }
+    }
+    p.inTerritory = true; p.trail = [];
+  }
+
+  function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+
+  Game.prototype.update = function(inputDir) {
+    if (!this.running) return;
+    this.ticks++;
+
+    // compute moves
+    const moves = {};
+    if (this.players[0].alive && typeof inputDir === 'number') moves[0] = inputDir;
+
+    // bots: simple wander + sometimes change toward neutral
+    for (let i=1;i<this.players.length;i++){
+      const p = this.players[i];
+      if (!p.alive) continue;
+      if (Math.random() < 0.18) {
+        p.dir = Math.floor(Math.random()*4);
+      } else {
+        // small tendency to go to neutral areas
+        if (Math.random() < 0.12) {
+          // pick small random offset and set dir toward it
+          const tx = clamp(p.x + Math.floor((Math.random()-0.5)*12), 0, W-1);
+          const ty = clamp(p.y + Math.floor((Math.random()-0.5)*12), 0, H-1);
+          const dx = tx - p.x, dy = ty - p.y;
+          if (Math.abs(dx) > Math.abs(dy)) p.dir = dx>0?DIRS.RIGHT:DIRS.LEFT;
+          else p.dir = dy>0?DIRS.DOWN:DIRS.UP;
+        }
+      }
+      moves[p.id] = p.dir;
+    }
+
+    // determine next positions and resolve collisions
+    const next = {};
+    const used = {};
+    for (const idStr in moves){
+      const pid = Number(idStr);
+      const p = this.players[pid];
+      if (!p.alive) continue;
+      const d = moves[pid];
+      const nx = clamp(p.x + V[d][0], 0, W-1);
+      const ny = clamp(p.y + V[d][1], 0, H-1);
+      next[pid] = [nx,ny,d];
+      // head-on collisions: if another plans same cell -> both die
+      const key = nx+','+ny;
+      if (used[key] !== undefined) {
+        // kill both
+        p.alive = false;
+        const other = this.players[used[key]];
+        other.alive = false;
+      } else used[key] = pid;
+    }
+
+    // apply moves
+    for (const pidStr in next){
+      const pid = Number(pidStr);
+      const p = this.players[pid];
+      if (!p.alive) continue;
+      const [nx,ny,d] = next[pid];
+      // check trail collision: landing on any active trail not owned by you -> die
+      const trOwner = this.trail[nx][ny];
+      if (trOwner !== -1 && trOwner !== pid) {
+        p.alive = false; continue;
+      }
+      // move
+      p.x = nx; p.y = ny; p.dir = d;
+      if (this.owner[nx][ny] === p.id) {
+        // returned to territory -> if had trail, close loop
+        if (p.trail.length > 0) {
+          this.closeLoop(p);
+        }
+        p.inTerritory = true;
+      } else {
+        // left territory or in enemy/neutral
+        if (p.inTerritory) p.inTerritory = false;
+        // check stepping on your own earlier trail = self-cross -> die
+        const found = p.trail.findIndex(c => c[0]===nx && c[1]===ny);
+        if (found !== -1) { p.alive = false; continue; }
+        // mark trail
+        this.trail[nx][ny] = p.id;
+        p.trail.push([nx,ny]);
+      }
+      // stepping on other player's territory is allowed (you can be on enemy)
+    }
+
+    // death on trail after all moved
+    for (const p of this.players){
+      if (!p.alive) continue;
+      const t = this.trail[p.x][p.y];
+      if (t !== -1 && t !== p.id) p.alive = false;
+    }
+
+    // clean up trails of dead players
+    for (const p of this.players){
+      if (!p.alive && p.trail.length>0){
+        for (const [tx,ty] of p.trail) this.trail[tx][ty] = -1;
+        p.trail = [];
+      }
+    }
+
+    this.updateScores();
+
+    // if player dead -> stop
+    if (!this.players[0].alive) this.running = false;
+  };
+
+  Game.prototype.updateScores = function(){
+    for (const p of this.players){
+      let c=0;
+      for (let x=0;x<W;x++) for (let y=0;y<H;y++) if (this.owner[x][y]===p.id) c++;
+      p.score=c;
+    }
+  }
+
+  Game.prototype.closeLoop = function(player) {
+    // flood-fill from borders avoiding owner's cells and trails treated as walls
+    const occ = Array.from({length:W}, ()=> new Array(H).fill(false));
+    for (let x=0;x<W;x++) for (let y=0;y<H;y++){
+      if (this.owner[x][y] !== -1 && this.owner[x][y] !== player.id) occ[x][y] = true;
+      if (this.trail[x][y] !== -1) occ[x][y] = true;
+    }
+    // player's own territory NOT marked occupied
+    // but player's trail acts as wall:
+    for (const [tx,ty] of player.trail) occ[tx][ty] = true;
+
+    const reach = Array.from({length:W}, ()=> new Array(H).fill(false));
+    const q = [];
+    // push borders
+    for (let x=0;x<W;x++){
+      if(!occ[x][0]){ reach[x][0]=true; q.push([x,0]); }
+      if(!occ[x][H-1]){ reach[x][H-1]=true; q.push([x,H-1]); }
+    }
+    for (let y=0;y<H;y++){
+      if(!occ[0][y]){ reach[0][y]=true; q.push([0,y]); }
+      if(!occ[W-1][y]){ reach[W-1][y]=true; q.push([W-1,y]); }
+    }
+    while(q.length){
+      const [cx,cy] = q.shift();
+      const nbrs = [[1,0],[-1,0],[0,1],[0,-1]];
+      for (const [dx,dy] of nbrs){
+        const nx = cx+dx, ny = cy+dy;
+        if (nx>=0 && nx<W && ny>=0 && ny<H && !reach[nx][ny] && !occ[nx][ny]){
+          reach[nx][ny]=true; q.push([nx,ny]);
+        }
+      }
+    }
+    // anything NOT reachable becomes player's territory
+    for (let x=0;x<W;x++) for (let y=0;y<H;y++){
+      if (!reach[x][y]) this.owner[x][y] = player.id;
+    }
+    // convert trail into territory and clear trail map
+    for (const [tx,ty] of player.trail){
+      this.trail[tx][ty] = -1;
+      this.owner[tx][ty] = player.id;
+    }
+    player.trail = [];
+    player.inTerritory = true;
+    this.updateScores();
+  };
+
+  Game.prototype.draw = function() {
+    // fast drawing: rects for owner, trails, players
+    ctx.fillStyle = BG; ctx.fillRect(0,0,canvas.width,canvas.height);
+
+    // owners
+    for (let x=0;x<W;x++){
+      for (let y=0;y<H;y++){
+        const o = this.owner[x][y];
+        if (o === -1) continue;
+        ctx.fillStyle = PLAYER_COLORS[o % PLAYER_COLORS.length];
+        ctx.fillRect(x*CELL, y*CELL, CELL, CELL);
+      }
+    }
+    // trails (lighter)
+    for (let x=0;x<W;x++){
+      for (let y=0;y<H;y++){
+        const t = this.trail[x][y];
+        if (t === -1) continue;
+        // lighter shade
+        ctx.fillStyle = shadeColor(PLAYER_COLORS[t % PLAYER_COLORS.length], 22);
+        ctx.fillRect(x*CELL, y*CELL, CELL, CELL);
+      }
+    }
+    // players
+    for (const p of this.players){
+      if (!p.alive) continue;
+      ctx.fillStyle = p.color;
+      const cx = p.x*CELL + CELL*0.5;
+      const cy = p.y*CELL + CELL*0.5;
+      const r = Math.max(2, CELL*0.45);
+      ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.fill();
+      // small eye indicating dir
+      const dx = V[p.dir][0]*Math.max(2,CELL*0.18);
+      const dy = V[p.dir][1]*Math.max(2,CELL*0.18);
+      ctx.fillStyle = '#000';
+      ctx.beginPath(); ctx.arc(cx+dx*0.35, cy+dy*0.35, Math.max(1, CELL*0.12), 0, Math.PI*2); ctx.fill();
+    }
+
+    // HUD overlay text
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.fillRect(6,6,220,56);
+    ctx.fillStyle = '#fff'; ctx.font = `${Math.max(10, CELL*0.8)}px system-ui`;
+    ctx.fillText(`Score: ${this.players[0].score}`, 12, 24);
+    ctx.fillText(`Ticks: ${this.ticks}`, 12, 44);
+
+    // opponents
+    let ox = canvas.width - 140, oy = 10;
+    ctx.fillStyle = 'rgba(0,0,0,0.25)';
+    ctx.fillRect(ox-6, oy-6, 128, 16 + 18 * Math.min(6, this.players.length-1));
+    ctx.fillStyle = '#fff'; ctx.font = `${Math.max(9, CELL*0.7)}px system-ui`;
+    ctx.fillText('Opponents:', ox, oy+10);
+    for (let i=1;i<this.players.length && i<=6;i++){
+      const p = this.players[i];
+      ctx.fillStyle = p.color;
+      ctx.fillText(`${p.id}: ${p.score}${!p.alive ? ' (dead)' : ''}`, ox, oy+10+18*i);
+    }
+  };
+
+  // small util to lighten color
+  function shadeColor(hex, percent) {
+    const f=parseInt(hex.slice(1),16),t=255,p=percent/100;
+    const R=f>>16, G=f>>8&0x00FF, B=f&0x0000FF;
+    const r = Math.min(255, Math.round(R + (255-R)*p));
+    const g = Math.min(255, Math.round(G + (255-G)*p));
+    const b = Math.min(255, Math.round(B + (255-B)*p));
+    return `rgb(${r},${g},${b})`;
+  }
+
+  // game instance
+  let game = new Game();
+
+  // input handling (touch + keyboard)
+  let currentDir = game.players[0].dir;
+
+  function setDir(d){
+    // prevent 180-degree reversal for more realistic feel
+    const opp = (d+2)%4;
+    if (game.players[0].dir === opp && game.players[0].trail.length>0) return;
+    currentDir = d;
+  }
+
+  // buttons
+  ['up','down','left','right'].forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener('touchstart', (e)=>{ e.preventDefault(); el.classList.add('active'); const map = {up:0,right:1,down:2,left:3}; setDir(map[id]); }, {passive:false});
+    el.addEventListener('touchend', (e)=>{ e.preventDefault(); el.classList.remove('active'); }, {passive:false});
+    el.addEventListener('mousedown', (e)=>{ e.preventDefault(); const map = {up:0,right:1,down:2,left:3}; setDir(map[id]); });
+  });
+
+  // keyboard support
+  window.addEventListener('keydown', (e)=>{
+    if (e.key === 'ArrowUp') setDir(DIRS.UP);
+    if (e.key === 'ArrowDown') setDir(DIRS.DOWN);
+    if (e.key === 'ArrowLeft') setDir(DIRS.LEFT);
+    if (e.key === 'ArrowRight') setDir(DIRS.RIGHT);
+    if (e.key === 'r' || e.key === 'R') restart();
+  });
+
+  // canvas swipe to change dir (optional)
+  let touchStart = null;
+  canvas.addEventListener('touchstart', (e)=>{ const t=e.changedTouches[0]; touchStart={x:t.clientX,y:t.clientY}; }, {passive:true});
+  canvas.addEventListener('touchend', (e)=>{ const t=e.changedTouches[0]; if(!touchStart) return; const dx=t.clientX-touchStart.x, dy=t.clientY-touchStart.y; if(Math.abs(dx)>Math.abs(dy) && Math.abs(dx)>20) setDir(dx>0?DIRS.RIGHT:DIRS.LEFT); else if(Math.abs(dy)>20) setDir(dy>0?DIRS.DOWN:DIRS.UP); touchStart=null; }, {passive:true});
+
+  // main loop
+  let last = performance.now();
+  const STEP_MS = 100; // game tick speed (ms)
+  function loop(now) {
+    const elapsed = now - last;
+    if (elapsed >= STEP_MS) {
+      last = now;
+      if (game.running) game.update(currentDir);
+      game.draw();
+      // show restart message if dead
+      if (!game.running && !game.players[0].alive) {
+        ctx.fillStyle = 'rgba(255,80,80,0.95)';
+        ctx.font = `${Math.max(14, CELL*1.1)}px system-ui`;
+        const s = 'GAME OVER — appuie sur Restart';
+        const w = ctx.measureText(s).width;
+        ctx.fillText(s, (canvas.width-w)/2, canvas.height/2);
+      }
+    }
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  function restart(){
+    game = new Game();
+    currentDir = game.players[0].dir;
+    game.draw();
+  }
+  restartBtn.addEventListener('click', restart);
+
+  // initial draw
+  game.draw();
+
+  // expose small helper to save snapshot? (not necessary)
+})();
+</script>
+</body>
+</html>
